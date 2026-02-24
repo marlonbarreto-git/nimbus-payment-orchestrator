@@ -420,3 +420,155 @@ func TestPaymentStore_ConcurrentAccess(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+func TestProcessPayment_EmptyTransactionID(t *testing.T) {
+	mon := health.NewMonitorWithConfig(50, 10*time.Minute)
+	procs := []processor.Processor{
+		newDeterministicProcessor("ProcA", []string{"card"}, model.Approved),
+	}
+	orch := New(procs, mon)
+
+	req := model.PaymentRequest{
+		TransactionID: "",
+		Amount:        100.0,
+		Currency:      "USD",
+		PaymentMethod: "card",
+		CustomerID:    "cust-1",
+	}
+	result := orch.ProcessPayment(context.Background(), req)
+	// Even with empty txn ID, orchestrator should process (validation is at HTTP layer)
+	assert.NotEmpty(t, result.Status)
+}
+
+func TestProcessPayment_VerySmallAmount(t *testing.T) {
+	mon := health.NewMonitorWithConfig(50, 10*time.Minute)
+	procs := []processor.Processor{
+		newDeterministicProcessor("ProcA", []string{"card"}, model.Approved),
+	}
+	orch := New(procs, mon)
+
+	req := model.PaymentRequest{
+		TransactionID: "tx-small",
+		Amount:        0.01,
+		Currency:      "USD",
+		PaymentMethod: "card",
+		CustomerID:    "cust-1",
+	}
+	result := orch.ProcessPayment(context.Background(), req)
+	assert.Equal(t, model.StatusApproved, result.Status)
+}
+
+func TestProcessPayment_LargeAmount(t *testing.T) {
+	mon := health.NewMonitorWithConfig(50, 10*time.Minute)
+	procs := []processor.Processor{
+		newDeterministicProcessor("ProcA", []string{"card"}, model.Approved),
+	}
+	orch := New(procs, mon)
+
+	req := model.PaymentRequest{
+		TransactionID: "tx-large",
+		Amount:        999999.99,
+		Currency:      "USD",
+		PaymentMethod: "card",
+		CustomerID:    "cust-1",
+	}
+	result := orch.ProcessPayment(context.Background(), req)
+	assert.Equal(t, model.StatusApproved, result.Status)
+}
+
+func TestProcessPayment_SingleProcessor(t *testing.T) {
+	mon := health.NewMonitorWithConfig(50, 10*time.Minute)
+	procs := []processor.Processor{
+		newDeterministicProcessor("OnlyProc", []string{"card"}, model.SoftDecline),
+	}
+	orch := New(procs, mon)
+
+	req := model.PaymentRequest{
+		TransactionID: "tx-single",
+		Amount:        100.0,
+		Currency:      "USD",
+		PaymentMethod: "card",
+		CustomerID:    "cust-1",
+	}
+	result := orch.ProcessPayment(context.Background(), req)
+	// Only 1 processor available, so only 1 attempt even though it's retriable
+	assert.Equal(t, model.StatusExhaustedRetries, result.Status)
+	assert.Len(t, result.Attempts, 1)
+}
+
+func TestProcessPayment_AllCircuitOpen(t *testing.T) {
+	mon := health.NewMonitorWithConfig(50, 10*time.Minute)
+
+	// Make all processors circuit-open
+	for i := 0; i < 20; i++ {
+		mon.RecordOutcome("ProcA", model.ProcessorError)
+		mon.RecordOutcome("ProcB", model.ProcessorError)
+	}
+
+	procs := []processor.Processor{
+		newDeterministicProcessor("ProcA", []string{"card"}, model.Approved),
+		newDeterministicProcessor("ProcB", []string{"card"}, model.Approved),
+	}
+	orch := New(procs, mon)
+
+	req := model.PaymentRequest{
+		TransactionID: "tx-all-open",
+		Amount:        100.0,
+		Currency:      "USD",
+		PaymentMethod: "card",
+		CustomerID:    "cust-1",
+	}
+	result := orch.ProcessPayment(context.Background(), req)
+	// All circuit open = no eligible processors = declined
+	assert.Equal(t, model.StatusDeclined, result.Status)
+	assert.Len(t, result.Attempts, 0)
+}
+
+func TestProcessPayment_HealthUpdatesAfterProcessing(t *testing.T) {
+	mon := health.NewMonitorWithConfig(50, 10*time.Minute)
+	procs := []processor.Processor{
+		newDeterministicProcessor("ProcA", []string{"card"}, model.Approved),
+	}
+	orch := New(procs, mon)
+
+	req := model.PaymentRequest{
+		TransactionID: "tx-health-update",
+		Amount:        100.0,
+		Currency:      "USD",
+		PaymentMethod: "card",
+		CustomerID:    "cust-1",
+	}
+	orch.ProcessPayment(context.Background(), req)
+
+	// After processing, health monitor should have recorded the outcome
+	h := mon.GetHealth("ProcA")
+	assert.Equal(t, 1, h.TotalRecent)
+	assert.Equal(t, 1, h.ApprovedCount)
+}
+
+func TestProcessPayment_RoutingReasonContainsInfo(t *testing.T) {
+	mon := health.NewMonitorWithConfig(50, 10*time.Minute)
+	procs := []processor.Processor{
+		newDeterministicProcessor("ProcA", []string{"card"}, model.SoftDecline),
+		newDeterministicProcessor("ProcB", []string{"card"}, model.Approved),
+	}
+	orch := New(procs, mon)
+
+	req := model.PaymentRequest{
+		TransactionID: "tx-reason",
+		Amount:        100.0,
+		Currency:      "USD",
+		PaymentMethod: "card",
+		CustomerID:    "cust-1",
+	}
+	result := orch.ProcessPayment(context.Background(), req)
+
+	require.Len(t, result.Attempts, 2)
+	// First attempt should mention "primary"
+	assert.Contains(t, result.Attempts[0].RoutingReason, "primary")
+	// Second attempt should mention "fallback" and the previous processor
+	assert.Contains(t, result.Attempts[1].RoutingReason, "fallback")
+	assert.Contains(t, result.Attempts[1].RoutingReason, "ProcA")
+	assert.Contains(t, result.Attempts[1].RoutingReason, "soft_decline")
+}
+
