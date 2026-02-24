@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -237,4 +238,61 @@ func TestResponseContentType(t *testing.T) {
 	mux.ServeHTTP(w, req)
 
 	assert.Equal(t, "application/json", w.Header().Get("Content-Type"))
+}
+
+func TestProcessPayment_AllPaymentMethods(t *testing.T) {
+	mux, _ := setupTestServer()
+
+	methods := []string{"card", "pix", "oxxo", "pse"}
+	for _, method := range methods {
+		t.Run(method, func(t *testing.T) {
+			body := fmt.Sprintf(`{"transaction_id":"tx-%s","amount":50,"currency":"USD","payment_method":"%s","customer_id":"c1"}`, method, method)
+			req := httptest.NewRequest("POST", "/payments", bytes.NewBufferString(body))
+			w := httptest.NewRecorder()
+			mux.ServeHTTP(w, req)
+
+			assert.Contains(t, []int{http.StatusOK, http.StatusUnprocessableEntity}, w.Code)
+		})
+	}
+}
+
+func TestProcessPayment_AllCurrencies(t *testing.T) {
+	mux, _ := setupTestServer()
+
+	currencies := []string{"USD", "BRL", "MXN", "COP"}
+	for _, currency := range currencies {
+		t.Run(currency, func(t *testing.T) {
+			body := fmt.Sprintf(`{"transaction_id":"tx-%s","amount":100,"currency":"%s","payment_method":"card","customer_id":"c1"}`, currency, currency)
+			req := httptest.NewRequest("POST", "/payments", bytes.NewBufferString(body))
+			w := httptest.NewRecorder()
+			mux.ServeHTTP(w, req)
+
+			assert.Contains(t, []int{http.StatusOK, http.StatusUnprocessableEntity}, w.Code)
+		})
+	}
+}
+
+func TestSimulateDegrade_MissingProcessorName(t *testing.T) {
+	mux, _ := setupTestServer()
+
+	body := `{"degraded":true}`
+	req := httptest.NewRequest("POST", "/simulate/degrade", bytes.NewBufferString(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+func TestSimulateBatch_DefaultMethodAndCurrency(t *testing.T) {
+	mux, _ := setupTestServer()
+
+	body := `{"count":5}`
+	req := httptest.NewRequest("POST", "/simulate/batch", bytes.NewBufferString(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	assert.Equal(t, float64(5), resp["total"])
 }
